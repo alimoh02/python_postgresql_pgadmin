@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# Brings up the docker compose stack and works around a networking quirk seen
-# on some Codespace/dev container hosts: Docker programs its per-network
-# container-to-container forwarding rule into iptables-nft, but the kernel
-# actually enforces iptables-legacy (FORWARD policy DROP there). Containers
-# can then resolve each other's DNS name but every packet between them is
-# dropped, so pgAdmin can never reach Postgres even though both are "Up".
-# This detects that case and adds the missing rule if needed.
+# Starts the Docker Compose stack and fixes missing iptables-legacy forwarding
+# rules that can block container-to-container and container-to-internet traffic.
+# Stale rules are removed because the bridge name changes when the network is
+# recreated.
 set -e
 
 cd "$(dirname "$0")/.."
@@ -13,6 +10,16 @@ cd "$(dirname "$0")/.."
 docker compose up -d
 
 if command -v iptables-legacy >/dev/null 2>&1; then
+  # Drop rules left behind for bridges that no longer exist.
+  while read -r br; do
+    if [ -n "$br" ] && ! ip link show "$br" >/dev/null 2>&1; then
+      sudo iptables-legacy -S FORWARD | grep -- "$br" | sed 's/^-A/-D/' | while read -r rule; do
+        sudo iptables-legacy $rule 2>/dev/null \
+          && echo "Removed stale forwarding rule for gone bridge $br"
+      done
+    fi
+  done < <(sudo iptables-legacy -S FORWARD | grep -oE 'br-[0-9a-f]+' | sort -u)
+
   CID=$(docker compose ps -q db 2>/dev/null || true)
   if [ -n "$CID" ]; then
     NET_NAME=$(docker inspect "$CID" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null || true)
@@ -21,11 +28,19 @@ if command -v iptables-legacy >/dev/null 2>&1; then
       if [ -n "$NET_ID" ]; then
         BR="br-$NET_ID"
         if ip link show "$BR" >/dev/null 2>&1; then
-          if ! sudo iptables-legacy -C FORWARD -i "$BR" -o "$BR" -j ACCEPT 2>/dev/null; then
-            sudo iptables-legacy -I FORWARD -i "$BR" -o "$BR" -j ACCEPT 2>/dev/null \
-              && echo "Added missing container-to-container forwarding rule for $BR" \
-              || echo "Warning: could not add iptables rule for $BR (containers may be unable to reach each other)"
-          fi
+          # Mirrors the rules Docker itself installs for docker0: traffic
+          # between containers on the bridge, traffic out to the internet, and
+          # the replies coming back.
+          add_rule() {
+            if ! sudo iptables-legacy -C FORWARD "$@" -j ACCEPT 2>/dev/null; then
+              sudo iptables-legacy -I FORWARD "$@" -j ACCEPT 2>/dev/null \
+                && echo "Added missing forwarding rule for $BR: $*" \
+                || echo "Warning: could not add iptables rule for $BR: $*"
+            fi
+          }
+          add_rule -o "$BR" -m conntrack --ctstate RELATED,ESTABLISHED
+          add_rule -i "$BR" ! -o "$BR"
+          add_rule -i "$BR" -o "$BR"
         fi
       fi
     fi
